@@ -413,7 +413,7 @@ private fun VehicleInstrumentClusterCard(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(180.dp),
+                    .height(200.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -476,7 +476,7 @@ private fun VehicleInstrumentClusterCard(
                             .background(HmiMintAccent)
                     )
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     CompassRpmGraphCanvas()
 

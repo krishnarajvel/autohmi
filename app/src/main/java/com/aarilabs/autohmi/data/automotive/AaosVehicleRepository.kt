@@ -1,3 +1,4 @@
+
 package com.aarilabs.autohmi.data.automotive
 
 import android.car.Car
@@ -15,14 +16,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 
 /**
  * AAOS vehicle-data adapter implementing [VehicleRepository].
@@ -32,132 +25,285 @@ class AaosVehicleRepository(
 ) : VehicleRepository {
 
     override val isSimulationMode: Boolean = false
+
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var car: Car? = null
     private var propertyManager: CarPropertyManager? = null
 
-    private val _vehicleState = MutableStateFlow(VehicleState(speedSource = TelemetrySource.UNAVAILABLE))
-    override val vehicleState: StateFlow<VehicleState> = _vehicleState.asStateFlow()
+    private val _vehicleState = MutableStateFlow(
+        VehicleState(
+            speedSource = TelemetrySource.UNAVAILABLE
+        )
+    )
 
-    private val repositoryScope =
-        CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    private var staleMonitorJob: Job? = null
-
-    private val staleTimeoutMs = 3_000L
+    override val vehicleState: StateFlow<VehicleState> =
+        _vehicleState.asStateFlow()
 
     fun connect() {
         if (car != null) {
-            Log.d("AutoHMI-AAOS", "Car connection already initialized")
+            Log.d(TAG, "Car connection already initialized")
             return
         }
 
-        Log.d("AutoHMI-AAOS", "Connecting to AAOS Car service...")
+        Log.d(TAG, "Connecting to AAOS Car service...")
 
         car = Car.createCar(
             appContext,
             mainHandler,
             Car.CAR_WAIT_TIMEOUT_DO_NOT_WAIT
         ) { carInstance, ready ->
+            handleCarServiceState(carInstance, ready)
+        }
+    }
 
-            Log.d("AutoHMI-AAOS", "Car service ready=$ready")
+    internal fun handleCarServiceState(
+        carInstance: Car?,
+        ready: Boolean
+    ) {
+        Log.d(TAG, "Car service ready=$ready")
 
-            if (!ready) return@createCar
+        if (!ready) {
+            handleCarServiceDisconnected()
+            return
+        }
 
-            val manager = carInstance.getCarManager(
-                Car.PROPERTY_SERVICE
-            ) as? CarPropertyManager
+        val manager = carInstance?.getCarManager(
+            Car.PROPERTY_SERVICE
+        ) as? CarPropertyManager
 
-            if (manager == null) {
-                Log.e("AutoHMI-AAOS", "CarPropertyManager unavailable")
-                return@createCar
-            }
+        if (manager == null) {
+            Log.e(TAG, "CarPropertyManager unavailable")
+            handleCarServiceDisconnected()
+            return
+        }
 
-            propertyManager = manager
-            Log.d("AutoHMI-AAOS", "CarPropertyManager connected")
+        // Clean up the previous manager before replacing it.
+        val previousManager = propertyManager
 
-            val config = manager.getCarPropertyConfig(
-                VehiclePropertyIds.PERF_VEHICLE_SPEED
-            )
-
-            Log.d(
-                "AutoHMI-AAOS",
-                "Vehicle speed property available=${config != null}"
-            )
-
-            if (config != null) {
-                manager.registerCallback(
-                    callback,
-                    VehiclePropertyIds.PERF_VEHICLE_SPEED,
-                    CarPropertyManager.SENSOR_RATE_ONCHANGE
+        if (previousManager != null && previousManager !== manager) {
+            try {
+                previousManager.unregisterCallback(callback)
+            } catch (e: Exception) {
+                Log.w(
+                    TAG,
+                    "Error unregistering previous callback: ${e.message}"
                 )
-
-                refreshSpeed(manager)
             }
+        }
+
+        propertyManager = manager
+        Log.d(TAG, "CarPropertyManager connected")
+
+        val config = manager.getCarPropertyConfig(
+            VehiclePropertyIds.PERF_VEHICLE_SPEED
+        )
+
+        Log.d(
+            TAG,
+            "Vehicle speed property available=${config != null}"
+        )
+
+        if (config == null) {
+            handleCarPropertyError()
+            return
+        }
+
+        try {
+            // Avoid duplicate registration on the same manager.
+            manager.unregisterCallback(callback)
+        } catch (_: Exception) {
+            // No existing registration is also a valid case.
+        }
+
+        val registered = manager.registerCallback(
+            callback,
+            VehiclePropertyIds.PERF_VEHICLE_SPEED,
+            CarPropertyManager.SENSOR_RATE_ONCHANGE
+        )
+
+        if (!registered) {
+            Log.e(TAG, "Failed to register vehicle speed callback")
+            handleCarPropertyError()
+            return
+        }
+
+        refreshSpeed(manager)
+    }
+
+    internal fun handleCarServiceDisconnected() {
+        Log.w(TAG, "AAOS Car service disconnected or unavailable")
+
+        try {
+            propertyManager?.unregisterCallback(callback)
+        } catch (e: Exception) {
+            Log.w(
+                TAG,
+                "Error unregistering callback during disconnect: ${e.message}"
+            )
+        }
+
+        propertyManager = null
+
+        _vehicleState.update { current ->
+            current.copy(
+                speedSource = TelemetrySource.UNAVAILABLE
+            )
         }
     }
 
     private val callback =
         object : CarPropertyManager.CarPropertyEventCallback {
+
             override fun onChangeEvent(value: CarPropertyValue<*>) {
-                if (value.propertyId == VehiclePropertyIds.PERF_VEHICLE_SPEED) {
-                    val rawValue = value.value
-                    val metresPerSecond = when (rawValue) {
-                        is Float -> rawValue
-                        is Number -> rawValue.toFloat()
-                        else -> null
-                    }
-                    if (metresPerSecond != null) {
-                        val kph = (metresPerSecond * 3.6f).toInt()
-                        onVhalSpeedReceived(kph)
-                    }
+                if (
+                    value.propertyId !=
+                    VehiclePropertyIds.PERF_VEHICLE_SPEED
+                ) {
+                    return
                 }
+
+                if (
+                    value.status !=
+                    CarPropertyValue.STATUS_AVAILABLE
+                ) {
+                    Log.w(
+                        TAG,
+                        "Vehicle speed property unavailable; " +
+                                "status=${value.status}"
+                    )
+                    handleCarPropertyError()
+                    return
+                }
+
+                val metresPerSecond = parseSpeed(value.value)
+
+                if (metresPerSecond == null) {
+                    Log.w(
+                        TAG,
+                        "Invalid vehicle speed value: ${value.value}"
+                    )
+                    handleCarPropertyError()
+                    return
+                }
+
+                onVhalSpeedReceived(
+                    (metresPerSecond * 3.6f).toInt()
+                )
             }
 
             override fun onErrorEvent(propId: Int, zone: Int) {
-                Log.e("AutoHMI-AAOS", "CarPropertyManager error event for propId=$propId, zone=$zone")
+                Log.e(
+                    TAG,
+                    "CarPropertyManager error event " +
+                            "for propId=$propId, zone=$zone"
+                )
+
+                if (propId == VehiclePropertyIds.PERF_VEHICLE_SPEED) {
+                    handleCarPropertyError()
+                }
             }
         }
 
-    private fun refreshSpeed(manager: CarPropertyManager) {
-        try {
-            val carPropValue: CarPropertyValue<*>? = manager.getProperty<CarPropertyValue<*>>(
-                VehiclePropertyIds.PERF_VEHICLE_SPEED,
-                0
+    internal fun handleCarPropertyError() {
+        _vehicleState.update { current ->
+            current.copy(
+                speedSource = TelemetrySource.UNAVAILABLE
             )
-            val rawValue = carPropValue?.value
-            val metresPerSecond = when (rawValue) {
-                is Float -> rawValue
-                is Number -> rawValue.toFloat()
-                else -> null
-            }
-
-            if (metresPerSecond != null) {
-                val kph = (metresPerSecond * 3.6f).toInt()
-                Log.d("AutoHMI-AAOS", "Initial vehicle speed read: $kph km/h ($metresPerSecond m/s)")
-                onVhalSpeedReceived(kph)
-            } else {
-                Log.w("AutoHMI-AAOS", "Initial vehicle speed value is null or unsupported type: $rawValue")
-            }
-        } catch (exception: SecurityException) {
-            Log.w("AutoHMI-AAOS", "SecurityException reading initial speed: ${exception.message}")
-        } catch (exception: IllegalArgumentException) {
-            Log.w("AutoHMI-AAOS", "IllegalArgumentException reading initial speed: ${exception.message}")
-        } catch (exception: Exception) {
-            Log.e("AutoHMI-AAOS", "Error reading initial vehicle speed: ${exception.message}", exception)
         }
     }
 
-    private fun onVhalSpeedReceived(kph: Int) {
+    private fun refreshSpeed(manager: CarPropertyManager) {
+        try {
+            val carPropValue: CarPropertyValue<*>? =
+                manager.getProperty<CarPropertyValue<*>>(
+                    VehiclePropertyIds.PERF_VEHICLE_SPEED,
+                    0
+                )
+
+            val speedValue = carPropValue
+
+            if (
+                speedValue == null ||
+                speedValue.status != CarPropertyValue.STATUS_AVAILABLE
+            ) {
+                Log.w(
+                    TAG,
+                    "Initial vehicle speed property is unavailable"
+                )
+                handleCarPropertyError()
+                return
+            }
+
+            val metresPerSecond = parseSpeed(speedValue.value)
+
+            if (metresPerSecond == null) {
+                Log.w(
+                    TAG,
+                    "Initial vehicle speed value is invalid: " +
+                            speedValue.value
+                )
+                handleCarPropertyError()
+                return
+            }
+
+            val kph = (metresPerSecond * 3.6f).toInt()
+
+            Log.d(
+                TAG,
+                "Initial vehicle speed read: " +
+                        "$kph km/h ($metresPerSecond m/s)"
+            )
+
+            onVhalSpeedReceived(kph)
+
+        } catch (exception: SecurityException) {
+            Log.w(
+                TAG,
+                "SecurityException reading initial speed: " +
+                        exception.message
+            )
+            handleCarPropertyError()
+
+        } catch (exception: IllegalArgumentException) {
+            Log.w(
+                TAG,
+                "IllegalArgumentException reading initial speed: " +
+                        exception.message
+            )
+            handleCarPropertyError()
+
+        } catch (exception: Exception) {
+            Log.e(
+                TAG,
+                "Error reading initial vehicle speed: " +
+                        exception.message,
+                exception
+            )
+            handleCarPropertyError()
+        }
+    }
+
+    private fun parseSpeed(rawValue: Any?): Float? {
+        val speed = when (rawValue) {
+            is Number -> rawValue.toFloat()
+            else -> return null
+        }
+
+        return speed.takeIf { it.isFinite() }
+
+    }
+
+    internal fun onVhalSpeedReceived(kph: Int) {
         updateSpeedState(kph)
     }
 
     override fun setSpeed(speedKph: Int) {
         Log.w(
-            "AutoHMI-AAOS",
-            "Ignoring manual speed input in vehicle mode: $speedKph km/h"
+            TAG,
+            "Ignoring manual speed input in vehicle mode: " +
+                    "$speedKph km/h"
         )
     }
 
@@ -176,28 +322,39 @@ class AaosVehicleRepository(
 
         if (speedChanged) {
             Log.d(
-                "AutoHMI-AAOS",
-                "Vehicle telemetry speed updated: $clampedSpeed km/h"
+                TAG,
+                "Vehicle telemetry speed updated: " +
+                        "$clampedSpeed km/h"
             )
         }
     }
 
     override fun setTemperature(temperatureCelsius: Int) {
         val clampedTemp = temperatureCelsius.coerceIn(16, 30)
+
         if (_vehicleState.value.temperatureCelsius != clampedTemp) {
-            Log.d("AutoHMI-AAOS", "Temperature updated: $clampedTemp °C")
+            Log.d(TAG, "Temperature updated: $clampedTemp °C")
+
             _vehicleState.update { current ->
-                current.copy(temperatureCelsius = clampedTemp, isHvacOn = true)
+                current.copy(
+                    temperatureCelsius = clampedTemp,
+                    isHvacOn = true
+                )
             }
         }
     }
 
     override fun setFanSpeed(level: Int) {
         val clampedLevel = level.coerceIn(0, 5)
+
         if (_vehicleState.value.fanSpeed != clampedLevel) {
-            Log.d("AutoHMI-AAOS", "Fan speed updated: Level $clampedLevel")
+            Log.d(TAG, "Fan speed updated: Level $clampedLevel")
+
             _vehicleState.update { current ->
-                current.copy(fanSpeed = clampedLevel, isHvacOn = clampedLevel > 0)
+                current.copy(
+                    fanSpeed = clampedLevel,
+                    isHvacOn = clampedLevel > 0
+                )
             }
         }
     }
@@ -205,15 +362,29 @@ class AaosVehicleRepository(
     override fun toggleHvac() {
         _vehicleState.update { current ->
             val nextHvacState = !current.isHvacOn
-            val nextFan = if (nextHvacState && current.fanSpeed == 0) 2 else if (!nextHvacState) 0 else current.fanSpeed
-            Log.d("AutoHMI-AAOS", "HVAC toggled: isHvacOn=$nextHvacState, fanSpeed=$nextFan")
-            current.copy(isHvacOn = nextHvacState, fanSpeed = nextFan)
+            val nextFan = when {
+                nextHvacState && current.fanSpeed == 0 -> 2
+                !nextHvacState -> 0
+                else -> current.fanSpeed
+            }
+
+            Log.d(
+                TAG,
+                "HVAC toggled: isHvacOn=$nextHvacState, " +
+                        "fanSpeed=$nextFan"
+            )
+
+            current.copy(
+                isHvacOn = nextHvacState,
+                fanSpeed = nextFan
+            )
         }
     }
 
     override fun updateGear(gear: String) {
         if (_vehicleState.value.gear != gear) {
-            Log.d("AutoHMI-AAOS", "Gear updated: $gear")
+            Log.d(TAG, "Gear updated: $gear")
+
             _vehicleState.update { current ->
                 current.copy(gear = gear)
             }
@@ -221,10 +392,13 @@ class AaosVehicleRepository(
     }
 
     fun disconnect() {
-        propertyManager?.unregisterCallback(callback)
-        propertyManager = null
+        handleCarServiceDisconnected()
 
         car?.disconnect()
         car = null
+    }
+
+    private companion object {
+        const val TAG = "AutoHMI-AAOS"
     }
 }
